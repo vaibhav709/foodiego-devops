@@ -1,0 +1,34 @@
+jenkins:
+  systemMessage: "FoodieGo DevOps | PBL-III | Vaibhav Shelke"
+  numExecutors: 2
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "admin"
+          password: "${ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: true
+unclassified:
+  location:
+    url: "http://localhost:8080/"
+jobs:
+  - script: |
+      folder('FoodieGo') { description('PBL-III DevOps practicals - FoodieGo food delivery + CareSync clinic') }
+      pipelineJob('FoodieGo/01-CI-CD-Helm') {
+        description('Practical 7: CI/CD - test, build Docker image, push, deploy to Kubernetes with Helm')
+        definition { cpsScm { scm { git { remote { url('${REPO_URL}') }; branch('*/main') } }; scriptPath('pipelines/Jenkinsfile.cicd'); lightweight(true) } }
+      }
+      pipelineJob('FoodieGo/02-Blue-Green') {
+        description('Practical 8: automated Blue-Green release with pre-switch verification and automatic rollback')
+        parameters {
+          stringParam('RELEASE', 'r1', 'Release label to deploy, e.g. r1, r2')
+          choiceParam('MODE', ['release', 'rollback'], 'release = deploy to idle slot and switch; rollback = point prod back')
+        }
+        definition { cpsScm { scm { git { remote { url('${REPO_URL}') }; branch('*/main') } }; scriptPath('pipelines/Jenkinsfile.bluegreen'); lightweight(true) } }
+      }
+      pipelineJob('FoodieGo/03-CareSync-DevSecOps') {
+        description('Practical 9: DevSecOps for the CareSync clinic API - Gitleaks, Bandit, pip-audit, Checkov, Trivy, SBOM, ZAP')
+        definition { cpsScm { scm { git { remote { url('${REPO_URL}') }; branch('*/main') } }; scriptPath('pipelines/Jenkinsfile.devsecops'); lightweight(true) } }
+      }
