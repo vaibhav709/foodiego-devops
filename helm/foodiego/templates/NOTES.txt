@@ -1,0 +1,1 @@
+FoodieGo {{ .Values.image.tag }} deployed. Open http://<EC2-PUBLIC-IP>:{{ .Values.service.nodePort }}
