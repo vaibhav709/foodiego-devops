@@ -1,0 +1,22 @@
+# Practical 8 - two Services in front of the blue and green slots.
+#   foodiego-prod  (NodePort 31002) : real users. spec.selector.slot decides blue or green.
+#   foodiego-stage (NodePort 31012) : always points at the idle slot for pre-release verification.
+apiVersion: v1
+kind: Namespace
+metadata: { name: foodiego-bg }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: foodiego-prod, namespace: foodiego-bg }
+spec:
+  type: NodePort
+  selector: { app: foodiego, slot: blue }
+  ports: [{ port: 80, targetPort: 8000, nodePort: 31002 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: foodiego-stage, namespace: foodiego-bg }
+spec:
+  type: NodePort
+  selector: { app: foodiego, slot: green }
+  ports: [{ port: 80, targetPort: 8000, nodePort: 31012 }]
