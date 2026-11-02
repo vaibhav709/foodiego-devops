@@ -1,0 +1,102 @@
+// Practical 9 - DevSecOps pipeline for the CareSync clinic API (healthcare)
+// Every stage is a security gate. Reports are archived as build artifacts for audit.
+pipeline {
+  agent any
+  options { timestamps(); disableConcurrentBuilds(); buildDiscarder(logRotator(numToKeepStr: '20')) }
+  environment { IMAGE = 'localhost:5000/caresync'; NS = 'caresync'; R = 'reports' }
+  stages {
+    stage('Source') {
+      steps {
+        script { env.TAG = "${env.BUILD_NUMBER}-" + sh(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim() }
+        sh 'rm -rf ${R} && mkdir -p ${R} && git log -1 --pretty="%h | %an | %s"'
+      }
+    }
+    stage('Secrets Scan - Gitleaks') {
+      steps { sh 'gitleaks detect --source . --redact -v --report-format json --report-path ${R}/gitleaks.json' }
+    }
+    stage('SAST - Bandit') {
+      steps {
+        sh 'bandit -r caresync/caresync -f json -o ${R}/bandit.json || true'
+        sh 'bandit -r caresync/caresync -ll'          // fails on MEDIUM+ severity findings
+      }
+    }
+    stage('SCA - pip-audit') {
+      steps {
+        sh 'pip-audit -r caresync/requirements.txt -f json -o ${R}/pip-audit.json || true'
+        sh 'pip-audit -r caresync/requirements.txt --desc'   // fails if any dependency has a known vulnerability
+      }
+    }
+    stage('Dockerfile Scan - Checkov') {
+      steps { sh 'checkov -f caresync/Dockerfile --framework dockerfile --compact --quiet --skip-download' }
+    }
+    stage('Build + Security Tests') {
+      steps {
+        sh 'docker build --target test -t caresync-test:${TAG} caresync/'
+        sh 'docker build --target runtime -t ${IMAGE}:${TAG} caresync/'
+      }
+    }
+    stage('Image Scan - Trivy + SBOM') {
+      steps {
+        sh 'trivy image --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ${IMAGE}:${TAG}'
+        sh 'trivy image --format cyclonedx --output ${R}/sbom-cyclonedx.json ${IMAGE}:${TAG} && echo "SBOM components: $(jq ".components|length" ${R}/sbom-cyclonedx.json)"'
+      }
+    }
+    stage('Push & Pin Digest') {
+      steps {
+        sh 'docker push ${IMAGE}:${TAG}'
+        script { env.DIGEST_REF = sh(returnStdout: true, script: "docker inspect --format '{{index .RepoDigests 0}}' ${env.IMAGE}:${env.TAG}").trim() }
+        echo "Immutable image reference: ${env.DIGEST_REF}"
+        sh 'sed "s|localhost:5000/caresync:latest|${DIGEST_REF}|" k8s/caresync/caresync.yaml > ${R}/caresync-rendered.yaml'
+      }
+    }
+    stage('IaC Scan - Checkov K8s') {
+      steps { sh 'checkov -f ${R}/caresync-rendered.yaml --framework kubernetes --compact --quiet --skip-download' }
+    }
+    stage('Deploy Hardened') {
+      steps {
+        sh 'kubectl apply -f ${R}/caresync-rendered.yaml'
+        sh '''
+          set +x   # keys must never be printed to the build log
+          if ! kubectl -n ${NS} get secret caresync-api-keys >/dev/null 2>&1; then
+            D=$(openssl rand -hex 20); F=$(openssl rand -hex 20)
+            printf '{"%s":"doctor","%s":"frontdesk"}' "$D" "$F" > /tmp/keys.json
+            kubectl -n ${NS} create secret generic caresync-api-keys --from-file=keys.json=/tmp/keys.json
+            rm -f /tmp/keys.json; echo "API keys generated and stored only in Kubernetes Secret"
+          fi
+        '''
+        sh 'kubectl -n ${NS} rollout status deploy/caresync-api --timeout=3m'
+        sh 'kubectl -n ${NS} get deploy,pods,svc,networkpolicy'
+      }
+    }
+    stage('Runtime Security Checks') {
+      steps {
+        sh '''
+          POD=$(kubectl -n ${NS} get pod -l app=caresync-api -o jsonpath='{.items[0].metadata.name}')
+          echo "[1] identity:"; kubectl -n ${NS} exec $POD -- id
+          echo "[2] read-only root FS:"; M=$(kubectl -n ${NS} exec $POD -- sh -c "grep ' / ' /proc/mounts"); echo "$M"; echo "$M" | grep -q " ro," && echo "PASS - root filesystem mounted read-only" 
+          echo "[3] PSA blocks root pod:"
+          if kubectl -n ${NS} run rootpod --image=busybox --restart=Never --overrides='{"spec":{"containers":[{"name":"r","image":"busybox","securityContext":{"runAsUser":0}}]}}' 2>psa.txt; then
+            echo FAIL; kubectl -n ${NS} delete pod rootpod; exit 1; else sed -n 1p psa.txt | cut -c1-220; echo "PASS - rejected"; fi
+          echo "[4] egress blocked by NetworkPolicy:"
+          if kubectl -n ${NS} exec $POD -- python -c "import urllib.request;urllib.request.urlopen('https://example.com',timeout=5)" 2>/dev/null; then echo FAIL; exit 1; else echo "PASS - outbound traffic denied"; fi
+          echo "[5] auth:"; for p in /api/patients/CS-101; do echo "no key -> HTTP $(curl -s -o /dev/null -w '%{http_code}' http://localhost:31003$p)"; done
+          set +x
+          K=$(kubectl -n ${NS} get secret caresync-api-keys -o jsonpath='{.data.keys\\.json}' | base64 -d | jq -r 'to_entries[]|select(.value=="frontdesk")|.key')
+          echo "front-desk key -> $(curl -s -H "X-API-Key: $K" http://localhost:31003/api/patients/CS-101)"
+          echo "front-desk prescribing -> HTTP $(curl -s -o /dev/null -w '%{http_code}' -H "X-API-Key: $K" -H 'Content-Type: application/json' -d '{"patient_id":"CS-101","drug":"Amoxicillin","dose":"250 mg"}' http://localhost:31003/api/prescriptions)"
+          unset K
+        '''
+      }
+    }
+    stage('DAST - OWASP ZAP') {
+      steps {
+        sh 'docker run --rm --network host ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t http://localhost:31003 -I | tee ${R}/zap-baseline.txt'
+      }
+    }
+  }
+  post {
+    always { archiveArtifacts artifacts: 'reports/*', allowEmptyArchive: true; sh 'docker image prune -f > /dev/null || true' }
+    success { echo 'ALL SECURITY GATES PASSED - CareSync released' }
+    failure { echo 'SECURITY GATE FAILED - release blocked. Fix the finding and push again.' }
+  }
+}

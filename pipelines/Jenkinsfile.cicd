@@ -1,0 +1,56 @@
+// Practical 7 - CI/CD: GitHub -> Jenkins -> Docker -> registry -> Helm release on Kubernetes
+pipeline {
+  agent any
+  options { timestamps(); disableConcurrentBuilds(); buildDiscarder(logRotator(numToKeepStr: '20')) }
+  triggers { pollSCM('H/2 * * * *') }
+  environment {
+    IMAGE   = 'localhost:5000/foodiego'
+    RELEASE = 'foodiego'
+    NS      = 'foodiego'
+  }
+  stages {
+    stage('Source') {
+      steps {
+        script { env.TAG = "${env.BUILD_NUMBER}-" + sh(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim() }
+        sh 'git log -1 --pretty="%h | %an | %s"'
+      }
+    }
+    stage('Lint Helm Chart') {
+      steps { sh 'helm lint helm/foodiego' }
+    }
+    stage('Unit Tests') {
+      steps { sh 'docker build --target test -t foodiego-test:${TAG} app/' }
+    }
+    stage('Build Image') {
+      steps {
+        sh 'docker build --target runtime --build-arg APP_VERSION=${TAG} -t ${IMAGE}:${TAG} app/'
+        sh 'docker image ls ${IMAGE}:${TAG}'
+      }
+    }
+    stage('Push Image') {
+      steps {
+        sh 'docker push ${IMAGE}:${TAG}'
+        sh 'curl -s http://localhost:5000/v2/foodiego/tags/list'
+      }
+    }
+    stage('Helm Deploy') {
+      steps {
+        sh 'helm upgrade --install ${RELEASE} helm/foodiego --namespace ${NS} --create-namespace --set image.tag=${TAG} --wait --timeout 3m --atomic'
+        sh 'helm history ${RELEASE} -n ${NS} --max 5'
+        sh 'kubectl -n ${NS} get deploy,rs,pods,svc -o wide'
+      }
+    }
+    stage('Verify') {
+      steps {
+        retry(5) { sleep 3; sh 'curl -fsS http://localhost:31001/healthz' }
+        sh 'curl -fsS http://localhost:31001/version; echo'
+        sh 'curl -fsS -X POST -H "Content-Type: application/json" -d \'{"items":[{"restaurant_id":2,"item":"Masala Dosa","qty":2}]}\' http://localhost:31001/api/orders; echo'
+      }
+    }
+  }
+  post {
+    success { echo "FoodieGo ${env.TAG} released via Helm - http://<EC2-IP>:31001" }
+    failure { echo 'Release failed - Helm --atomic has already rolled back to the last good revision' }
+    always  { sh 'docker image prune -f > /dev/null || true' }
+  }
+}

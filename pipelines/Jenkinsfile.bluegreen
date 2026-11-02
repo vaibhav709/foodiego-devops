@@ -1,0 +1,96 @@
+// Practical 8 - automated Blue-Green release for FoodieGo
+//  * new release goes to the IDLE slot, verified through foodiego-stage, then prod selector is switched atomically
+//  * post-switch health watch: if prod errors after the switch, Jenkins switches back automatically
+//  * MODE=rollback points prod at the other (still running) slot in about a second
+pipeline {
+  agent any
+  options { timestamps(); disableConcurrentBuilds(); buildDiscarder(logRotator(numToKeepStr: '20')) }
+  parameters {
+    string(name: 'RELEASE', defaultValue: 'r1', description: 'Release label to deploy, e.g. r1, r2')
+    choice(name: 'MODE', choices: ['release', 'rollback'], description: 'release or rollback')
+  }
+  environment { IMAGE = 'localhost:5000/foodiego-bg'; NS = 'foodiego-bg' }
+  stages {
+    stage('Inspect Prod') {
+      steps {
+        script {
+          sh 'kubectl -n ${NS} get svc foodiego-prod >/dev/null 2>&1 || kubectl apply -f k8s/bluegreen/services.yaml'
+          env.ACTIVE = sh(returnStdout: true, script: "kubectl -n ${env.NS} get svc foodiego-prod -o jsonpath='{.spec.selector.slot}'").trim()
+          def ready = sh(returnStdout: true, script: "kubectl -n ${env.NS} get deploy foodiego-${env.ACTIVE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true").trim()
+          env.IDLE = (ready in ['', '0']) ? env.ACTIVE : (env.ACTIVE == 'blue' ? 'green' : 'blue')
+          echo "Prod is on '${env.ACTIVE}' (ready=${ready ?: 0}). Target slot for this run: '${env.IDLE}'"
+        }
+      }
+    }
+    stage('Test & Build') {
+      when { expression { params.MODE == 'release' } }
+      steps {
+        sh 'docker build --target test -t foodiego-bg-test:${RELEASE} app/'
+        sh 'docker build --target runtime --build-arg APP_VERSION=${RELEASE} -t ${IMAGE}:${RELEASE} app/ && docker push ${IMAGE}:${RELEASE}'
+      }
+    }
+    stage('Deploy Idle Slot') {
+      when { expression { params.MODE == 'release' } }
+      steps {
+        sh 'SLOT=${IDLE} IMAGE=${IMAGE}:${RELEASE} envsubst < k8s/bluegreen/slot.yaml.tpl | tee slot-${IDLE}.yaml | kubectl apply -f -'
+        sh 'kubectl -n ${NS} rollout status deploy/foodiego-${IDLE} --timeout=3m'
+      }
+    }
+    stage('Verify on Stage') {
+      when { expression { params.MODE == 'release' } }
+      steps {
+        sh 'kubectl -n ${NS} patch svc foodiego-stage --type merge -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodiego\\",\\"slot\\":\\"${IDLE}\\"}}}"'
+        retry(6) { sleep 3; sh 'curl -fsS http://localhost:31012/healthz' }
+        sh '''
+          V=$(curl -fsS http://localhost:31012/version); echo "stage -> $V"
+          echo "$V" | grep -q "\\"version\\":\\"${RELEASE}\\"" && echo "$V" | grep -q "\\"slot\\":\\"${IDLE}\\""
+          curl -fsS http://localhost:31012/api/restaurants > /dev/null && echo "functional check passed on ${IDLE}"
+        '''
+      }
+    }
+    stage('Switch Prod') {
+      when { expression { params.MODE == 'release' } }
+      steps {
+        sh 'kubectl -n ${NS} patch svc foodiego-prod --type merge -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodiego\\",\\"slot\\":\\"${IDLE}\\"}}}"'
+        echo "PROD SWITCHED: ${env.ACTIVE} -> ${env.IDLE}"
+      }
+    }
+    stage('Post-switch Watch') {
+      when { expression { params.MODE == 'release' && env.ACTIVE != env.IDLE } }
+      steps {
+        script {
+          def bad = sh(returnStatus: true, script: '''
+            for i in $(seq 1 10); do
+              curl -fsS -o /dev/null http://localhost:31002/healthz || exit 1; sleep 1
+            done''')
+          if (bad != 0) {
+            sh 'kubectl -n ${NS} patch svc foodiego-prod --type merge -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodiego\\",\\"slot\\":\\"${ACTIVE}\\"}}}"'
+            error "Prod unhealthy after switch - automatically switched back to ${env.ACTIVE}"
+          }
+          echo '10/10 post-switch health checks passed'
+        }
+      }
+    }
+    stage('Rollback') {
+      when { expression { params.MODE == 'rollback' } }
+      steps {
+        script {
+          env.IDLE = (env.ACTIVE == 'blue') ? 'green' : 'blue'
+          def ready = sh(returnStdout: true, script: "kubectl -n ${env.NS} get deploy foodiego-${env.IDLE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true").trim()
+          if (ready in ['', '0']) { error "No healthy ${env.IDLE} slot to roll back to" }
+        }
+        sh 'kubectl -n ${NS} patch svc foodiego-prod --type merge -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodiego\\",\\"slot\\":\\"${IDLE}\\"}}}"'
+        echo "ROLLED BACK: ${env.ACTIVE} -> ${env.IDLE}"
+      }
+    }
+    stage('Prod Status') {
+      steps {
+        sh 'curl -fsS http://localhost:31002/version; echo'
+        sh 'kubectl -n ${NS} get deploy,svc -L slot,release -o wide'
+      }
+    }
+  }
+  post {
+    always { sh 'docker image prune -f > /dev/null || true' }
+  }
+}
