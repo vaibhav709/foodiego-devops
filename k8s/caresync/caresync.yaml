@@ -1,0 +1,90 @@
+# Practical 9 - CareSync hardened deployment (least privilege, zero-trust network)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: caresync
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: caresync-api
+  namespace: caresync
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: caresync-api
+  namespace: caresync
+  labels: { app: caresync-api }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: caresync-api }
+  template:
+    metadata:
+      labels: { app: caresync-api }
+    spec:
+      serviceAccountName: caresync-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: localhost:5000/caresync:latest   # Jenkins sets the scanned build tag
+          imagePullPolicy: Always
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: CARESYNC_KEYS_FILE, value: /etc/caresync/keys.json }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: api-keys, mountPath: /etc/caresync, readOnly: true }   # secret mounted as a file, not an env var
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { cpu: 300m, memory: 192Mi }
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 3, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }
+      volumes:
+        - name: api-keys
+          secret: { secretName: caresync-api-keys, defaultMode: 0400 }
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 32Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: caresync-api, namespace: caresync }
+spec:
+  type: NodePort
+  selector: { app: caresync-api }
+  ports: [{ port: 80, targetPort: 8080, nodePort: 31003 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: deny-all, namespace: caresync }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-http-to-api, namespace: caresync }
+spec:
+  podSelector: { matchLabels: { app: caresync-api } }
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{ protocol: TCP, port: 8080 }]
