@@ -13,7 +13,7 @@ RESTAURANTS = [
 ]
 
 MENU = {
-    1: [{"item": "Paneer Butter Masala", "price": 260}, {"item": "Dal Makhani", "price": 220}, {"item": "Butter Naan", "price": 45}],
+    1: [{"item": "Paneer Butter Masala", "price": 260}, {"item": "Dal Makhani", "price": 220}, {"item": "Butter Naan", "price": 45}, {"item": "Gulab Jamun", "price": 80}],
     2: [{"item": "Masala Dosa", "price": 120}, {"item": "Idli Sambar", "price": 90}, {"item": "Filter Coffee", "price": 50}],
     3: [{"item": "Veg Hakka Noodles", "price": 180}, {"item": "Chilli Paneer", "price": 230}, {"item": "Spring Rolls", "price": 150}],
     4: [{"item": "Margherita Pizza", "price": 299}, {"item": "Farmhouse Pizza", "price": 399}, {"item": "Garlic Bread", "price": 129}],
