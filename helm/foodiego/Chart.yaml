@@ -1,0 +1,6 @@
+apiVersion: v2
+name: foodiego
+description: FoodieGo food-ordering web app (PBL-III Practical 7)
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

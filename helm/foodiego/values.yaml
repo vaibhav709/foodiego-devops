@@ -1,0 +1,12 @@
+replicaCount: 3
+image:
+  repository: localhost:5000/foodiego
+  tag: latest          # overridden by Jenkins with <build>-<commit>
+  pullPolicy: IfNotPresent
+service:
+  type: NodePort
+  port: 80
+  nodePort: 31001
+resources:
+  requests: { cpu: 50m, memory: 96Mi }
+  limits: { cpu: 300m, memory: 192Mi }
